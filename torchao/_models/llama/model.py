@@ -13,6 +13,7 @@ from torch import Tensor
 from torch.nn import functional as F
 from torchao.utils import find_multiple
 import os
+import time
 
 # TODO remove suplerfluous arg
 def prepare_inputs_for_model(inps, max_new_tokens=1):
@@ -80,6 +81,11 @@ transformer_configs = {
     "Llama-3.1-405B": dict(block_size=131072, n_layer=126, n_head=128, n_local_heads=8, dim=16384, intermediate_size=53248, vocab_size=128256, rope_base=500000,
         use_scaled_rope=True
     ),
+    # added
+    "Llama-2-7b-hf": dict(block_size=4096, n_layer=32, n_head=32, dim=4096, intermediate_size=11008),
+    "Llama-2-13b-hf": dict(block_size=4096, n_layer=40, n_head=40, dim=5120, intermediate_size=14336),
+    "Llama-2-70b-hf": dict(block_size=4096, n_layer=80, n_head=64, n_local_heads=8, dim=4096, intermediate_size=28672),
+    'vicuna-68m':dict(block_size=2048, n_layer=2, n_head=12, dim=768, intermediate_size=3072),
 }
 
 # this is a model specific variable that controls whether index_put is used for the kv_cache update, 
@@ -262,6 +268,12 @@ class TransformerBlock(nn.Module):
         h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
+    
+    def forward_mpe_single(self, x: Tensor, input_pos: Optional[Tensor], freqs_cis: Tensor, mask: Optional[Tensor]) -> Tensor:
+        h_attn, times_attn = self.attention(self.attention_norm(x), freqs_cis, mask, input_pos)
+        h = x + h_attn
+        h_ffn, times_ffn = self.feed_forward(self.ffn_norm(h))
+        return h + h_ffn, times_attn + times_ffn
 
 
 class Attention(nn.Module):
@@ -271,16 +283,16 @@ class Attention(nn.Module):
 
         total_head_dim = (config.n_head + 2 * config.n_local_heads) * config.head_dim
         # key, query, value projections for all heads, but in a batch
-        if os.environ.get("UNFUSED", None) is not None:
+        if os.environ.get("FUSED", None) is not None:
+            self.unfused = False
+            self.wqkv = nn.Linear(config.dim, total_head_dim, bias=False)
+            self._register_load_state_dict_pre_hook(self.load_hook)
+        else:
             self.unfused = True
             self.wq = nn.Linear(config.dim, config.n_head*config.head_dim, bias=False)
             self.wk = nn.Linear(config.dim, config.n_local_heads*config.head_dim, bias=False)
             self.wv = nn.Linear(config.dim, config.n_local_heads*config.head_dim, bias=False)
             self._register_load_state_dict_pre_hook(self.load_hook_unfused)
-        else:
-            self.unfused = False
-            self.wqkv = nn.Linear(config.dim, total_head_dim, bias=False)
-            self._register_load_state_dict_pre_hook(self.load_hook)
             
         self.wo = nn.Linear(config.dim, config.dim, bias=False)
         self.kv_cache = None
@@ -307,6 +319,7 @@ class Attention(nn.Module):
                  self.wv.weight.shape[0]],
                 dim=0,
             )
+            # import code; code.interact('load_hook_unfused', local=dict(globals(), **locals()))
             state_dict[prefix + "wq.weight"] = wq
             state_dict[prefix + "wk.weight"] = wk
             state_dict[prefix + "wv.weight"] = wv
@@ -320,14 +333,16 @@ class Attention(nn.Module):
         else:
             q, k, v = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1)
 
-        q = q.view(bsz, seqlen, self.n_head, self.head_dim)
-        k = k.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        v = v.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        q = q.view(bsz, seqlen, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(bsz, seqlen, self.n_local_heads, self.head_dim).transpose(1, 2)
+        v = v.view(bsz, seqlen, self.n_local_heads, self.head_dim).transpose(1, 2)
 
         q = apply_rotary_emb(q, freqs_cis)
         k = apply_rotary_emb(k, freqs_cis)
 
-        q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
+        # q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
+        # if k.dtype == torch.float or v.dtype == torch.float:
+        #     import code; code.interact("float dtype line 336", local=dict(globals(), **locals()))
 
         if self.kv_cache is not None:
             k, v = self.kv_cache.update(input_pos, k, v)
@@ -344,7 +359,6 @@ class Attention(nn.Module):
         y = self.wo(y)
         return y
 
-
 class FeedForward(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
         super().__init__()
@@ -354,7 +368,6 @@ class FeedForward(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
-
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
@@ -400,26 +413,56 @@ def precompute_freqs_cis(
     dtype: torch.dtype = torch.bfloat16,
     use_scaled: bool=False
 ) -> Tensor:
-    freqs = 1.0 / (base ** (torch.arange(0, n_elem, 2)[: (n_elem // 2)].float() / n_elem))
+    freqs = 1.0 / (base ** (torch.arange(0, n_elem, 2).float() / n_elem))
     t = torch.arange(seq_len, device=freqs.device)
     if use_scaled:
         freqs = apply_scaling(freqs)
     freqs = torch.outer(t, freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+    freqs_cis = torch.cat((freqs_cis, freqs_cis), dim=-1)
     cache = torch.stack([freqs_cis.real, freqs_cis.imag], dim=-1)
+    # cache = cache.view(1, 1, seq_len, -1, 2)
     return cache.to(dtype=dtype)
 
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
-def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
-    xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
-    freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2)
-    x_out2 = torch.stack(
-        [
-            xshaped[..., 0] * freqs_cis[..., 0] - xshaped[..., 1] * freqs_cis[..., 1],
-            xshaped[..., 1] * freqs_cis[..., 0] + xshaped[..., 0] * freqs_cis[..., 1],
-        ],
-        -1,
-    )
 
-    x_out2 = x_out2.flatten(3)
-    return x_out2.type_as(x)
+def apply_rotary_emb(x: Tensor, freqs_cis: Tensor):
+    # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
+    freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(0)
+    return (x * freqs_cis[..., 0]) + (rotate_half(x) * freqs_cis[..., 1])
+
+# def precompute_freqs_cis(
+#     seq_len: int, 
+#     n_elem: int, 
+#     base: int = 10000,
+#     dtype: torch.dtype = torch.bfloat16,
+#     use_scaled: bool=False
+# ) -> Tensor:
+#     freqs = 1.0 / (base ** (torch.arange(0, n_elem, 2)[: (n_elem // 2)].float() / n_elem))
+#     t = torch.arange(seq_len, device=freqs.device)
+#     if use_scaled:
+#         freqs = apply_scaling(freqs)
+#     freqs = torch.outer(t, freqs)
+#     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+#     cache = torch.stack([freqs_cis.real, freqs_cis.imag], dim=-1)
+#     return cache.to(dtype=dtype)
+
+
+# def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
+#     xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
+#     freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2)
+#     x_out2 = torch.stack(
+#         [
+#             xshaped[..., 0] * freqs_cis[..., 0] - xshaped[..., 1] * freqs_cis[..., 1],
+#             xshaped[..., 1] * freqs_cis[..., 0] + xshaped[..., 0] * freqs_cis[..., 1],
+#         ],
+#         -1,
+#     )
+
+#     x_out2 = x_out2.flatten(3)
+#     return x_out2.type_as(x)
