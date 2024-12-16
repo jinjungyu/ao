@@ -100,24 +100,27 @@ def get_extensions():
             extra_compile_args["nvcc"].append("-g")
             extra_link_args.append("/DEBUG")
 
-    this_dir = os.path.dirname(os.path.curdir)
-    extensions_dir = os.path.join(this_dir, "torchao", "csrc")
-    sources = list(glob.glob(os.path.join(extensions_dir, "**/*.cpp"), recursive=True))
+    
+    ext_modules = []
+    
+    # this_dir = os.path.dirname(os.path.curdir)
+    # extensions_dir = os.path.join(this_dir, "torchao", "csrc")
+    # sources = list(glob.glob(os.path.join(extensions_dir, "**/*.cpp"), recursive=True))
 
-    extensions_cuda_dir = os.path.join(extensions_dir, "cuda")
-    cuda_sources = list(glob.glob(os.path.join(extensions_cuda_dir, "**/*.cu"), recursive=True))
+    # extensions_cuda_dir = os.path.join(extensions_dir, "cuda")
+    # cuda_sources = list(glob.glob(os.path.join(extensions_cuda_dir, "**/*.cu"), recursive=True))
 
-    if use_cuda:
-        sources += cuda_sources
+    # if use_cuda:
+    #     sources += cuda_sources
 
-    ext_modules = [
-        extension(
-            "torchao._C",
-            sources,
-            extra_compile_args=extra_compile_args,
-            extra_link_args=extra_link_args,
-        )
-    ]
+    # ext_modules = [
+    #     extension(
+    #         "torchao._C",
+    #         sources,
+    #         extra_compile_args=extra_compile_args,
+    #         extra_link_args=extra_link_args,
+    #     )
+    # ]
 
     return ext_modules
 
